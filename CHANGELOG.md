@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [1.4.2](https://github.com/wesmoncrief/obsidian-todoist-text/compare/1.4.1...1.4.2) (2026-04-01)
+
+
+### Bug Fixes
+
+* use requestUrl with Todoist API v1 task endpoints ([f07b6c7](https://github.com/wesmoncrief/obsidian-todoist-text/commit/f07b6c7bf0beb0dc0d661e241b81e734dbcc1685))
+
 ### [1.4.1](https://github.com/wesmoncrief/obsidian-todoist-text/compare/1.4.0...1.4.1) (2025-04-05)
 
 
