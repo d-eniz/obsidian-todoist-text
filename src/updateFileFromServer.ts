@@ -1,7 +1,8 @@
-import {App, Editor, Notice, } from 'obsidian'
+import {App, Editor, EditorChange, Notice, } from 'obsidian'
 import {TodoistSettings} from "./DefaultSettings";
 import {
 	closeTodoistTask,
+	createTodoistTask,
 	extractTaskIdFromLine,
 	getTodoistTask,
 	getTodoistTasks,
@@ -10,6 +11,41 @@ import {
 	toTodoistRequestError
 } from "./todoistApiClient";
 
+type ChecklistState = "open" | "closed";
+
+export type EditorMutationRunner = (mutation: () => void) => void;
+
+interface MarkdownListItem {
+	indentText: string;
+	indentSize: number;
+	hasCheckbox: boolean;
+	checkboxState: ChecklistState | null;
+	content: string;
+}
+
+interface TodoistTaskCreationCandidate {
+	indentText: string;
+	content: string;
+	parentId?: string;
+	siblingTaskId?: string;
+	priority?: number;
+}
+
+const TODOIST_TO_CLIENT_PRIORITY = new Map<number, number>([
+	[1, 4],
+	[2, 3],
+	[3, 2],
+	[4, 1]
+]);
+
+const CLIENT_TO_TODOIST_PRIORITY = new Map<number, number>([
+	[1, 4],
+	[2, 3],
+	[3, 2],
+	[4, 1]
+]);
+
+const DEFAULT_EDITOR_MUTATION_RUNNER: EditorMutationRunner = (mutation: () => void) => mutation();
 
 export async function updateFileFromServer(settings: TodoistSettings, app: App) {
 	const file = app.workspace.getActiveFile();
@@ -41,54 +77,109 @@ export async function updateFileFromServer(settings: TodoistSettings, app: App) 
 	}
 }
 
-export async function toggleServerTaskStatus(e: Editor, settings: TodoistSettings) {
-	try {
-		const lineText = e.getLine(e.getCursor().line);
-		// The line must start with only whitespace, then have a dash. A currently checked off box
-		// can have any non-whitespace character. This matches the behavior of Obsidian's
-		// editor:toggle-checklist-status command.
-		const tryingToCloseRegex = /^\s*- \[\s]/;
-		const tryingToReOpenRegex = /^\s*- \[\S]/;
-		const tryingToClose = tryingToCloseRegex.test(lineText)
-		const tryingToReOpen = tryingToReOpenRegex.test(lineText)
+export async function syncTodoistTaskStatusChanges(
+	editor: Editor,
+	settings: TodoistSettings,
+	oldLines: string[],
+	newLines: string[],
+	changedLineNumbers: number[],
+	runEditorMutation: EditorMutationRunner = DEFAULT_EDITOR_MUTATION_RUNNER
+) {
+	for (const lineNumber of changedLineNumbers) {
+		const oldLineText = oldLines[lineNumber];
+		const newLineText = newLines[lineNumber];
+		if (oldLineText === undefined || newLineText === undefined) {
+			continue;
+		}
 
-		if (
-			!(
-				lineText.contains("[src](https://todoist.com/showTask?id=") ||
-				lineText.contains("[src](https://app.todoist.com/app/task/")
-			) &&
-			(tryingToClose || tryingToReOpen)
-		) {
+		const taskId = extractTaskIdFromLine(newLineText);
+		if (taskId === null || taskId !== extractTaskIdFromLine(oldLineText)) {
+			continue;
+		}
+
+		const oldState = getChecklistState(oldLineText);
+		const newState = getChecklistState(newLineText);
+		if (oldState === null || newState === null || oldState === newState) {
+			continue;
+		}
+
+		await syncTodoistTaskStatus(editor, settings, lineNumber, newLineText, taskId, newState, runEditorMutation);
+	}
+}
+
+export function getTodoistTaskCreationCandidateLineNumbers(lines: string[], changedLineNumbers: number[]): number[] {
+	return changedLineNumbers.filter((lineNumber) => getTodoistTaskCreationCandidate(lines, lineNumber) !== null);
+}
+
+export async function createTodoistTaskFromEditorLine(
+	editor: Editor,
+	settings: TodoistSettings,
+	lineNumber: number,
+	runEditorMutation: EditorMutationRunner = DEFAULT_EDITOR_MUTATION_RUNNER
+): Promise<boolean> {
+	try {
+		const initialLines = getEditorLines(editor);
+		const candidate = getTodoistTaskCreationCandidate(initialLines, lineNumber);
+		if (candidate === null) {
+			return false;
+		}
+
+		if (settings.authToken.contains("TODO - ")) {
+			new Notice("Todoist Text: You need to configure your Todoist API token in the Todoist Text plugin settings");
+			return false;
+		}
+
+		const createOptions = await getTodoistTaskCreateOptions(settings, candidate);
+		const createdTask = await createTodoistTask(settings.authToken, {
+			content: candidate.content,
+			projectId: createOptions.projectId,
+			sectionId: createOptions.sectionId,
+			parentId: createOptions.parentId,
+			priority: candidate.priority,
+			dueDate: getLocalTodayDate()
+		});
+
+		const currentLines = getEditorLines(editor);
+		const currentCandidate = getTodoistTaskCreationCandidate(currentLines, lineNumber);
+		if (currentCandidate === null || currentCandidate.content !== candidate.content || currentCandidate.priority !== candidate.priority) {
+			new Notice(`Todoist Text: Created "${createdTask.content}" on Todoist`);
+			return true;
+		}
+
+		replaceEditorLines(editor, [{
+			lineNumber,
+			text: getFormattedTaskDetailWithIndent(createdTask, currentCandidate.indentText, false).trimEnd()
+		}], runEditorMutation);
+		new Notice(`Todoist Text: Created "${createdTask.content}" on Todoist`);
+		return true;
+	}
+	catch (e){
+		console.log("todoist text error: ", e);
+		new Notice("Todoist Text: Error trying to create task. See console log for more details.")
+		return false;
+	}
+}
+
+async function syncTodoistTaskStatus(
+	editor: Editor,
+	settings: TodoistSettings,
+	lineNumber: number,
+	lineText: string,
+	taskId: string,
+	newState: ChecklistState,
+	runEditorMutation: EditorMutationRunner
+) {
+	try {
+		if (settings.authToken.contains("TODO - ")) {
+			new Notice("Todoist Text: You need to configure your Todoist API token in the Todoist Text plugin settings");
 			return;
 		}
 
-		const taskId = extractTaskIdFromLine(lineText);
-		if(!taskId) {
-		  console.warn("cannot find task ID in ", lineText);
-		  return;
-		}
-
 		const serverTaskName = (await getTodoistTask(settings.authToken, taskId)).content;
-		if (tryingToClose) {
+		if (newState === "closed") {
 			await closeTodoistTask(settings.authToken, taskId);
-			
-			const actionedTaskTabCount = lineText.split(/[^\t]/)[0].length;
+			const subtasksClosed = markChildTasks(editor, lineNumber, lineText, "closed", runEditorMutation);
 
-			// check if there are any subtasks and mark them closed
-			let subtasksClosed = 0;
-			for (let line = e.getCursor().line + 1; line < e.lineCount(); line++) {
-				const lineText = e.getLine(line);
-				const tabCount = lineText.split(/[^\t]/)[0].length;
-				if (tabCount==0) break;
-
-				if (tabCount > actionedTaskTabCount) {
-					const replacedText = lineText.replace("- [ ]", "- [x]");
-					if (replacedText != lineText) { subtasksClosed++};
-					e.setLine(line, replacedText);
-				}
-			}
-			
-			// advise user task is closed, along with any subtasks if they were found
 			let taskClosedMessage = `Todoist Text: Closed "${serverTaskName}" on Todoist`;
 			if (subtasksClosed > 0) {
 				const plural = subtasksClosed == 1 ? "" : "s";
@@ -97,40 +188,295 @@ export async function toggleServerTaskStatus(e: Editor, settings: TodoistSetting
 			new Notice(taskClosedMessage);
 		}
 
-		if (tryingToReOpen) {
+		if (newState === "open") {
 			await reopenTodoistTask(settings.authToken, taskId);
+			const parentTasksOpened = markParentTasks(editor, lineNumber, lineText, "open", runEditorMutation);
 
-			const actionedTaskTabCount = lineText.split(/[^\t]/)[0].length;
-			
-			// check if there are any parent tasks and mark them opened
-			let parentTasksOpened = 0;
-			for (let line = e.getCursor().line - 1; line > 1; line--) {
-				const lineText = e.getLine(line);
-				const tabCount = lineText.split(/[^\t]/)[0].length;
-
-				if (tabCount < actionedTaskTabCount) {
-					const replacedText = lineText.replace("- [X]", "- [ ]").replace("- [x]", "- [ ]");
-					if (replacedText != lineText) { parentTasksOpened++};
-					e.setLine(line, replacedText);
-				}
-
-				if (tabCount==0 && parentTasksOpened > 0) break; // found the topmost task
-			}
-
-			// advise user task is open, along with any parent tasks if they were found
 			let taskOpenedMessage = `Todoist Text: Re-opened "${serverTaskName}" on Todoist`;
 			if (parentTasksOpened > 0) {
 				const plural = parentTasksOpened == 1 ? "" : "s";
 				taskOpenedMessage = taskOpenedMessage + ` and its parent task${plural}.`;
 			}
 			new Notice(taskOpenedMessage);
-
 		}
 	}
 	catch (e){
 		console.log("todoist text error: ", e);
 		new Notice("Todoist Text: Error trying to update task status. See console log for more details.")
 	}
+}
+
+function getChecklistState(lineText: string): ChecklistState | null {
+	const listItem = parseMarkdownListItem(lineText);
+	return listItem === null ? null : listItem.checkboxState;
+}
+
+function parseMarkdownListItem(lineText: string): MarkdownListItem | null {
+	const checkboxMatch = lineText.match(/^(\s*)-\s+\[([^\]])]\s*(.*)$/);
+	if (checkboxMatch !== null) {
+		const checkboxCharacter = checkboxMatch[2];
+		return {
+			indentText: checkboxMatch[1],
+			indentSize: getIndentSize(checkboxMatch[1]),
+			hasCheckbox: true,
+			checkboxState: checkboxCharacter.trim().length === 0 ? "open" : "closed",
+			content: checkboxMatch[3].trim()
+		};
+	}
+
+	const bulletMatch = lineText.match(/^(\s*)-\s+(.*)$/);
+	if (bulletMatch === null) {
+		return null;
+	}
+
+	return {
+		indentText: bulletMatch[1],
+		indentSize: getIndentSize(bulletMatch[1]),
+		hasCheckbox: false,
+		checkboxState: null,
+		content: bulletMatch[2].trim()
+	};
+}
+
+function getIndentSize(indentText: string): number {
+	let indentSize = 0;
+	for (const character of indentText) {
+		indentSize += character === "\t" ? 4 : 1;
+	}
+	return indentSize;
+}
+
+function getTodoistTaskCreationCandidate(lines: string[], lineNumber: number): TodoistTaskCreationCandidate | null {
+	const lineText = lines[lineNumber];
+	if (lineText === undefined || extractTaskIdFromLine(lineText) !== null || lineText.includes("[src](")) {
+		return null;
+	}
+
+	const listItem = parseMarkdownListItem(lineText);
+	if (listItem === null || listItem.content.length === 0 || listItem.checkboxState === "closed") {
+		return null;
+	}
+
+	const parentId = findParentTodoistTaskId(lines, lineNumber, listItem.indentSize);
+	const siblingTaskId = findTodoistTaskIdAtSameIndent(lines, lineNumber, listItem.indentSize);
+	if (!listItem.hasCheckbox && !(listItem.indentSize === 0 && siblingTaskId !== undefined)) {
+		return null;
+	}
+	if (listItem.hasCheckbox && parentId === undefined && siblingTaskId === undefined) {
+		return null;
+	}
+
+	const localTaskContent = getLocalTaskContent(listItem.content);
+	if (localTaskContent.content.length === 0) {
+		return null;
+	}
+
+	return {
+		indentText: listItem.indentText,
+		content: localTaskContent.content,
+		parentId,
+		siblingTaskId,
+		priority: localTaskContent.priority
+	};
+}
+
+async function getTodoistTaskCreateOptions(
+	settings: TodoistSettings,
+	candidate: TodoistTaskCreationCandidate
+): Promise<{ parentId?: string; projectId?: string; sectionId?: string }> {
+	if (candidate.parentId !== undefined || candidate.siblingTaskId === undefined) {
+		return { parentId: candidate.parentId };
+	}
+
+	const siblingTask = await getTodoistTask(settings.authToken, candidate.siblingTaskId);
+	if (siblingTask.sectionId !== null) {
+		return { sectionId: siblingTask.sectionId };
+	}
+	if (siblingTask.projectId !== null) {
+		return { projectId: siblingTask.projectId };
+	}
+	return {};
+}
+
+function getLocalTaskContent(content: string): { content: string; priority?: number } {
+	const priorityMatch = content.match(/\s*--\s*p([1-4])\s*$/i);
+	if (priorityMatch === null) {
+		return { content: content.trim() };
+	}
+
+	return {
+		content: content.substring(0, priorityMatch.index ?? 0).trim(),
+		priority: CLIENT_TO_TODOIST_PRIORITY.get(Number(priorityMatch[1]))
+	};
+}
+
+function getLocalTodayDate(): string {
+	const today = new Date();
+	const year = today.getFullYear();
+	const month = String(today.getMonth() + 1).padStart(2, "0");
+	const day = String(today.getDate()).padStart(2, "0");
+	return `${year}-${month}-${day}`;
+}
+
+function findParentTodoistTaskId(lines: string[], lineNumber: number, indentSize: number): string | undefined {
+	for (let line = lineNumber - 1; line >= 0; line--) {
+		const lineText = lines[line];
+		if (lineText.trim().length === 0) {
+			break;
+		}
+
+		const listItem = parseMarkdownListItem(lineText);
+		if (listItem === null) {
+			break;
+		}
+
+		const taskId = extractTaskIdFromLine(lineText);
+		if (taskId !== null && listItem.indentSize < indentSize) {
+			return taskId;
+		}
+	}
+	return undefined;
+}
+
+function findTodoistTaskIdAtSameIndent(lines: string[], lineNumber: number, indentSize: number): string | undefined {
+	return findTodoistTaskIdAtSameIndentInDirection(lines, lineNumber, indentSize, -1) ??
+		findTodoistTaskIdAtSameIndentInDirection(lines, lineNumber, indentSize, 1);
+}
+
+function findTodoistTaskIdAtSameIndentInDirection(lines: string[], lineNumber: number, indentSize: number, direction: number): string | undefined {
+	for (let line = lineNumber + direction; line >= 0 && line < lines.length; line += direction) {
+		const lineText = lines[line];
+		if (lineText.trim().length === 0) {
+			break;
+		}
+
+		const listItem = parseMarkdownListItem(lineText);
+		if (listItem === null || listItem.indentSize < indentSize) {
+			break;
+		}
+		const taskId = extractTaskIdFromLine(lineText);
+		if (listItem.indentSize === indentSize && taskId !== null) {
+			return taskId;
+		}
+	}
+	return undefined;
+}
+
+function markChildTasks(
+	editor: Editor,
+	lineNumber: number,
+	lineText: string,
+	state: ChecklistState,
+	runEditorMutation: EditorMutationRunner
+): number {
+	const actionedTask = parseMarkdownListItem(lineText);
+	if (actionedTask === null) {
+		return 0;
+	}
+
+	const changes: { lineNumber: number; text: string }[] = [];
+	for (let line = lineNumber + 1; line < editor.lineCount(); line++) {
+		const childLineText = editor.getLine(line);
+		if (childLineText.trim().length === 0) {
+			break;
+		}
+
+		const childTask = parseMarkdownListItem(childLineText);
+		if (childTask === null || childTask.indentSize <= actionedTask.indentSize) {
+			break;
+		}
+		if (childTask.checkboxState === state) {
+			continue;
+		}
+
+		const replacedText = setChecklistState(childLineText, state);
+		if (replacedText !== childLineText) {
+			changes.push({ lineNumber: line, text: replacedText });
+		}
+	}
+
+	replaceEditorLines(editor, changes, runEditorMutation);
+	return changes.length;
+}
+
+function markParentTasks(
+	editor: Editor,
+	lineNumber: number,
+	lineText: string,
+	state: ChecklistState,
+	runEditorMutation: EditorMutationRunner
+): number {
+	const actionedTask = parseMarkdownListItem(lineText);
+	if (actionedTask === null) {
+		return 0;
+	}
+
+	let parentIndent = actionedTask.indentSize;
+	const changes: { lineNumber: number; text: string }[] = [];
+	for (let line = lineNumber - 1; line >= 0; line--) {
+		const parentLineText = editor.getLine(line);
+		if (parentLineText.trim().length === 0) {
+			break;
+		}
+
+		const parentTask = parseMarkdownListItem(parentLineText);
+		if (parentTask === null) {
+			break;
+		}
+
+		if (parentTask.indentSize >= parentIndent) {
+			continue;
+		}
+
+		parentIndent = parentTask.indentSize;
+		if (parentTask.checkboxState === state) {
+			continue;
+		}
+
+		const replacedText = setChecklistState(parentLineText, state);
+		if (replacedText !== parentLineText) {
+			changes.push({ lineNumber: line, text: replacedText });
+		}
+		if (parentIndent === 0) {
+			break;
+		}
+	}
+
+	replaceEditorLines(editor, changes, runEditorMutation);
+	return changes.length;
+}
+
+function setChecklistState(lineText: string, state: ChecklistState): string {
+	const checkboxCharacter = state === "closed" ? "x" : " ";
+	return lineText.replace(/^(\s*-\s+\[)[^\]](]\s*)/, `$1${checkboxCharacter}$2`);
+}
+
+function replaceEditorLines(
+	editor: Editor,
+	lines: { lineNumber: number; text: string }[],
+	runEditorMutation: EditorMutationRunner
+) {
+	const changes: EditorChange[] = lines
+		.filter((line) => line.lineNumber >= 0 && line.lineNumber < editor.lineCount() && editor.getLine(line.lineNumber) !== line.text)
+		.map((line) => ({
+			from: { line: line.lineNumber, ch: 0 },
+			to: { line: line.lineNumber, ch: editor.getLine(line.lineNumber).length },
+			text: line.text
+		}));
+
+	if (changes.length === 0) {
+		return;
+	}
+
+	runEditorMutation(() => editor.transaction({ changes }));
+}
+
+function getEditorLines(editor: Editor): string[] {
+	const lines: string[] = [];
+	for (let line = 0; line < editor.lineCount(); line++) {
+		lines.push(editor.getLine(line));
+	}
+	return lines;
 }
 
 async function getServerData(todoistQuery: string, authToken: string, showSubtasks: boolean): Promise<string> {
@@ -221,23 +567,22 @@ function getSubTasks(subtasks: TodoistTask[], parentId: string, indent: number):
 }
 
 function getFormattedTaskDetail(task: TodoistTask, indent: number, showSubtaskSymbol: boolean): string {	
-	let description = getTaskDescription(task.description, indent);
-	let tabs = "\t".repeat(indent);
-
-	// used to fix the difference between the app and API (https://github.com/Doist/todoist-python/issues/18)
-	const priorityMap = new Map<number, number>([
-		[1, 4],
-		[2, 3],
-		[3, 2],
-		[4, 1]
-	])
-
-	const subtaskIndicator = (showSubtaskSymbol && task.parentId != null) ? "⮑ " : "";
-
-	return `${tabs}- [ ] ${subtaskIndicator}${task.content} -- p${priorityMap.get(task.priority)} -- [src](${task.url}) ${description}\n`;
+	return getFormattedTaskDetailWithIndent(task, "\t".repeat(indent), showSubtaskSymbol);
 }
 
-function getTaskDescription(description: string, indent: number): string {
-	let tabs = "\t".repeat(indent);
-	return description.length === 0 ? "" : `\n${tabs}\t- ${description.trim().replace(/(?:\r\n|\r|\n)+/g, '\n\t- ')}`;
+function getFormattedTaskDetailWithIndent(task: TodoistTask, indentText: string, showSubtaskSymbol: boolean): string {
+	let description = getTaskDescription(task.description, indentText);
+	const subtaskIndicator = (showSubtaskSymbol && task.parentId != null) ? "⮑ " : "";
+	const priority = TODOIST_TO_CLIENT_PRIORITY.get(task.priority) ?? 4;
+	const linkText = `${subtaskIndicator}${escapeMarkdownLinkText(task.content)}`;
+
+	return `${indentText}- [ ] [${linkText}](${task.url}) \\(P${priority}\\)${description}\n`;
+}
+
+function escapeMarkdownLinkText(text: string): string {
+	return text.replace(/([\\[\]])/g, "\\$1");
+}
+
+function getTaskDescription(description: string, indentText: string): string {
+	return description.length === 0 ? "" : `\n${indentText}\t- ${description.trim().replace(/(?:\r\n|\r|\n)+/g, `\n${indentText}\t- `)}`;
 }

@@ -4,6 +4,22 @@ This obsidian plugin integrates your Todoist tasks with markdown checkboxes in a
 
 Demo: ![demo](https://raw.githubusercontent.com/wesmoncrief/obsidian-todoist-text/master/demo.gif)
 
+## Changes in this fork
+
+The following changes were vibe coded for my personal use. It is not advised to clone this fork for your own use.
+
+- Checking or unchecking a Todoist-backed checkbox now syncs the task state with Todoist automatically; no separate command is required.
+- The "Todoist Text: Toggle todoist task" command remains available as a local checkbox toggle.
+- New unchecked checklist items added inside a synced list create Todoist tasks automatically.
+- Top-level bullets next to synced Todoist tasks also create new top-level Todoist tasks.
+- New top-level tasks are created in the same section or project as the nearest same-level Todoist task when available.
+- Indented checklist items are created as subtasks of the nearest parent Todoist task.
+- New tasks are created with today's date by default.
+- New task lines can include `-- p1` through `-- p4`; the suffix is converted to Todoist priority.
+- Rendered Todoist tasks now link the task title directly and show priority outside the link, e.g. `[Task title](https://app.todoist.com/app/task/...) \(P1\)`.
+- Todoist task links support both `todoist.com/showTask?id=...` and `app.todoist.com/app/task/...` URLs.
+- The Todoist API client uses Obsidian `requestUrl`, handles Todoist API v1 task endpoints, and supports paginated filter results.
+
 # Usage
 1. Ensure you understand the security implications (see Security section of this file)
 2. Install this plugin (Todoist Text) through Obsidian and enable it
@@ -20,16 +36,18 @@ You can enable automatic replacement of the keyword with todos in the settings, 
 If you want to use a template file (e.g. for Daily Notes) and you have automatic replacement of your keyword enabled, you will find that your template file itself would have its keyword get replaced with todos. To prevent this, you can add your template folder to the "Excluded Folders" in the settings. Then, you can just place your keyword in the template file, and the files that it generates should automatically replace the keyword with your todos.
 
 ## Marking tasks as complete and re-opening
-When your cursor is on the line of a Todo created by this plugin, executing the command "Todoist Text: Toggle todoist task" will complete that task on Todoist and check off the task on your local file.
+Checking or unchecking a Todo created by this plugin will update that task on Todoist.
 
-You will likely want to use the `<Cmd>-<Enter>` hot key to check off tasks. To do this, go to the Settings -> Hotkeys. Find the command "Todoist Text: Toggle todoist task", and set the hot key as desired. If you set the hot key to `<Cmd>-<Enter>`, be sure to remove `<Cmd>-<Enter>` from its default ("Toggle Checklist Status"). 
+You can still use the "Todoist Text: Toggle todoist task" command/hot key to toggle the current line locally. To do this, go to the Settings -> Hotkeys. Find the command "Todoist Text: Toggle todoist task", and set the hot key as desired. If you set the hot key to `<Cmd>-<Enter>`, be sure to remove `<Cmd>-<Enter>` from its default ("Toggle Checklist Status").
 
-You can use the "Todoist Text: Toggle todoist task" command/hot key for any check list item, even if it is unrelated to Todoist. Under the hood, the command will check the suffix of the checklist item, and if it contains a Todoist URL, it will update that todo on Todoist. If it does not end with a Todoist URL, it will simply check/uncheck the line locally.
+You can use the "Todoist Text: Toggle todoist task" command/hot key for any check list item, even if it is unrelated to Todoist. If the line contains a Todoist task URL, the checkbox change will update Todoist. If it does not contain a Todoist task URL, it will simply check/uncheck the line locally.
 
-Clicking a checklist box with the mouse is currently not supported.
+When closing a task, any indented subtasks in the local file will also be checked. When re-opening a subtask, parent tasks in the local file will also be unchecked.
 
 ## Adding/updating tasks
-This plugin currently does not support adding tasks to Todoist. Until then, I recommend using the Todoist desktop app - it has a global shortcut that can quickly add a task from anywhere on your computer.
+To add a task to Todoist from a synced list, add a new unchecked checklist item in the list. A top-level bullet item also works when it is next to existing Todoist tasks. Top-level tasks are created in the same section or project as the nearest same-level Todoist task when available; indented checklist items are created as subtasks of the nearest parent Todoist task.
+
+New tasks are created with today's date by default. You can add a priority suffix like `-- p1` through `-- p4`; the suffix will be converted to Todoist priority and replaced with a linked task title after the task is created.
 
 This plugin does not automatically update your local files based on remote changes to Todoist tasks. This may be supported later, please reach out via a GitHub issue if this would be useful to you.
 

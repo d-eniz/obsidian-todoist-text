@@ -10,9 +10,20 @@ export interface TodoistTask {
 	id: string;
 	content: string;
 	description: string;
+	projectId: string | null;
+	sectionId: string | null;
 	priority: number;
 	parentId: string | null;
 	url: string;
+}
+
+export interface CreateTodoistTaskOptions {
+	content: string;
+	projectId?: string;
+	sectionId?: string;
+	parentId?: string;
+	priority?: number;
+	dueDate?: string;
 }
 
 export interface TodoistRequestError extends Error {
@@ -154,6 +165,14 @@ function normalizeTodoistTask(taskValue: unknown): TodoistTask | null {
 	const parentId = parentIdValue === null || parentIdValue === undefined || String(parentIdValue).length === 0
 		? null
 		: String(parentIdValue);
+	const projectIdValue = taskValue.projectId !== undefined ? taskValue.projectId : taskValue.project_id;
+	const projectId = projectIdValue === null || projectIdValue === undefined || String(projectIdValue).length === 0
+		? null
+		: String(projectIdValue);
+	const sectionIdValue = taskValue.sectionId !== undefined ? taskValue.sectionId : taskValue.section_id;
+	const sectionId = sectionIdValue === null || sectionIdValue === undefined || String(sectionIdValue).length === 0
+		? null
+		: String(sectionIdValue);
 	const priority = typeof taskValue.priority === "number" ? taskValue.priority : 1;
 	const taskUrl = typeof taskValue.url === "string" && taskValue.url.length > 0
 		? taskValue.url
@@ -163,6 +182,8 @@ function normalizeTodoistTask(taskValue: unknown): TodoistTask | null {
 		id,
 		content: typeof taskValue.content === "string" ? taskValue.content : "",
 		description: typeof taskValue.description === "string" ? taskValue.description : "",
+		projectId,
+		sectionId,
 		priority,
 		parentId,
 		url: taskUrl
@@ -223,6 +244,34 @@ export async function getTodoistTask(authToken: string, taskId: string): Promise
 	const task = normalizeTodoistTask(response.data);
 	if (task === null) {
 		throw toTodoistRequestError(new Error("Unable to parse Todoist task data."));
+	}
+	return task;
+}
+
+export async function createTodoistTask(authToken: string, options: CreateTodoistTaskOptions): Promise<TodoistTask> {
+	const body: Record<string, string | number> = {
+		content: options.content
+	};
+	if (options.projectId !== undefined) {
+		body.project_id = options.projectId;
+	}
+	if (options.sectionId !== undefined) {
+		body.section_id = options.sectionId;
+	}
+	if (options.parentId !== undefined) {
+		body.parent_id = options.parentId;
+	}
+	if (options.priority !== undefined) {
+		body.priority = options.priority;
+	}
+	if (options.dueDate !== undefined) {
+		body.due_date = options.dueDate;
+	}
+
+	const response = await todoistRequest(authToken, "POST", "tasks", undefined, body);
+	const task = normalizeTodoistTask(response.data);
+	if (task === null) {
+		throw toTodoistRequestError(new Error("Unable to parse created Todoist task data."));
 	}
 	return task;
 }

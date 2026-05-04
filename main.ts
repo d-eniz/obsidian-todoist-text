@@ -1,20 +1,35 @@
-import {App, ButtonComponent, Editor, MarkdownView, Plugin, PluginSettingTab, Setting} from 'obsidian';
-import {toggleServerTaskStatus, updateFileFromServer} from "./src/updateFileFromServer";
+import type {Text} from '@codemirror/state';
+import {EditorView} from '@codemirror/view';
+import type {ViewUpdate} from '@codemirror/view';
+import {App, ButtonComponent, Editor, editorInfoField, MarkdownView, Plugin, PluginSettingTab, Setting} from 'obsidian';
+import {
+	createTodoistTaskFromEditorLine,
+	getTodoistTaskCreationCandidateLineNumbers,
+	syncTodoistTaskStatusChanges,
+	updateFileFromServer
+} from "./src/updateFileFromServer";
 import {FolderSuggest} from "./src/suggest/folderSuggester";
 import {migrateSettings} from "./src/settingsMigrator";
 import {DEFAULT_SETTINGS, TodoistSettings} from "./src/DefaultSettings";
 
+const TASK_CREATION_DEBOUNCE_MS = 2000;
+
 export default class TodoistPlugin extends Plugin {
 	settings: TodoistSettings;
 	hasIntervalFailure: boolean = false;
+	private ignoredEditorChangeDepth: number = 0;
+	private pendingTaskCreationTimers: Map<string, number> = new Map();
+	private taskCreationInProgress: Set<string> = new Set();
+
 	async onload() {
 		await this.loadSettings();
+
+		this.registerEditorExtension(EditorView.updateListener.of((update: ViewUpdate) => this.handleEditorUpdate(update)));
 
 		this.addCommand({
 			id: 'toggle-todoist-task',
 			name: 'Toggle todoist task',
 			editorCallback: (editor: Editor, view: MarkdownView) => {
-				toggleServerTaskStatus(editor, this.settings);
 				// @ts-ignore undocumented but was recommended to use here - https://github.com/obsidianmd/obsidian-releases/pull/768#issuecomment-1038441881
 				view.app.commands.executeCommandById("editor:toggle-checklist-status")
 			}
@@ -72,7 +87,8 @@ export default class TodoistPlugin extends Plugin {
 	}
 
 	onunload() {
-
+		this.pendingTaskCreationTimers.forEach((timer) => window.clearTimeout(timer));
+		this.pendingTaskCreationTimers.clear();
 	}
 
 	async loadSettings() {
@@ -83,6 +99,116 @@ export default class TodoistPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	private handleEditorUpdate(update: ViewUpdate) {
+		if (!update.docChanged || this.ignoredEditorChangeDepth > 0) {
+			return;
+		}
+
+		const editorInfo = update.state.field(editorInfoField, false);
+		if (editorInfo === undefined || editorInfo.editor === undefined || editorInfo.file === undefined) {
+			return;
+		}
+
+		const changedLineNumbers = getChangedLineNumbers(update);
+		if (changedLineNumbers.length === 0) {
+			return;
+		}
+
+		const oldLines = update.startState.doc.toString().split("\n");
+		const newLines = update.state.doc.toString().split("\n");
+		void syncTodoistTaskStatusChanges(
+			editorInfo.editor,
+			this.settings,
+			oldLines,
+			newLines,
+			changedLineNumbers,
+			(mutation) => this.runWithIgnoredEditorChanges(mutation)
+		);
+
+		this.scheduleTodoistTaskCreations(
+			editorInfo.editor,
+			editorInfo.file.path,
+			changedLineNumbers,
+			getTodoistTaskCreationCandidateLineNumbers(newLines, changedLineNumbers)
+		);
+	}
+
+	private scheduleTodoistTaskCreations(
+		editor: Editor,
+		filePath: string,
+		changedLineNumbers: number[],
+		candidateLineNumbers: number[]
+	) {
+		const candidateLines = new Set(candidateLineNumbers);
+		changedLineNumbers.forEach((lineNumber) => {
+			const key = `${filePath}:${lineNumber}`;
+			const existingTimer = this.pendingTaskCreationTimers.get(key);
+			if (existingTimer !== undefined) {
+				window.clearTimeout(existingTimer);
+				this.pendingTaskCreationTimers.delete(key);
+			}
+			if (!candidateLines.has(lineNumber) || this.taskCreationInProgress.has(key)) {
+				return;
+			}
+
+			const timer = window.setTimeout(async () => {
+				this.pendingTaskCreationTimers.delete(key);
+				if (this.taskCreationInProgress.has(key)) {
+					return;
+				}
+
+				this.taskCreationInProgress.add(key);
+				try {
+					await createTodoistTaskFromEditorLine(
+						editor,
+						this.settings,
+						lineNumber,
+						(mutation) => this.runWithIgnoredEditorChanges(mutation)
+					);
+				}
+				finally {
+					this.taskCreationInProgress.delete(key);
+				}
+			}, TASK_CREATION_DEBOUNCE_MS);
+			this.pendingTaskCreationTimers.set(key, timer);
+		});
+	}
+
+	private runWithIgnoredEditorChanges(mutation: () => void) {
+		this.ignoredEditorChangeDepth++;
+		try {
+			mutation();
+		}
+		finally {
+			window.setTimeout(() => {
+				this.ignoredEditorChangeDepth = Math.max(0, this.ignoredEditorChangeDepth - 1);
+			}, 0);
+		}
+	}
+}
+
+function getChangedLineNumbers(update: ViewUpdate): number[] {
+	const changedLineNumbers = new Set<number>();
+	update.changes.iterChangedRanges((fromA, toA, fromB, toB) => {
+		addChangedLineRange(update.state.doc, fromB, toB, changedLineNumbers);
+
+		if (fromB === toB) {
+			addChangedLineRange(update.startState.doc, fromA, toA, changedLineNumbers);
+		}
+	});
+	return Array.from(changedLineNumbers).sort((a, b) => a - b);
+}
+
+function addChangedLineRange(doc: Text, from: number, to: number, changedLineNumbers: Set<number>) {
+	const startPosition = Math.max(0, Math.min(from, doc.length));
+	const endPosition = Math.max(startPosition, Math.min(to, doc.length));
+	const startLineNumber = doc.lineAt(startPosition).number - 1;
+	const endLineNumber = doc.lineAt(endPosition).number - 1;
+
+	for (let lineNumber = startLineNumber; lineNumber <= endLineNumber; lineNumber++) {
+		changedLineNumbers.add(lineNumber);
 	}
 }
 
