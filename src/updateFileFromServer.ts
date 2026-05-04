@@ -576,7 +576,7 @@ function getFormattedTaskDetailWithIndent(task: TodoistTask, indentText: string,
 	const priority = TODOIST_TO_CLIENT_PRIORITY.get(task.priority) ?? 4;
 	const linkText = `${subtaskIndicator}${escapeMarkdownLinkText(task.content)}`;
 
-	return `${indentText}- [ ] [${linkText}](${task.url}) \\(P${priority}\\)${description}\n`;
+	return `${indentText}- [ ] [${linkText}](${task.url}) (P${priority})${description}\n`;
 }
 
 function escapeMarkdownLinkText(text: string): string {
